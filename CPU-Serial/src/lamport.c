@@ -108,14 +108,18 @@ int get_bit(const uint8_t *bytes, int bit_idx) {
 
 // Key Generation
 // Fills secret key array with random numbers, then hashes each one once to create public key array
-void keygen(secret_key_t *sk, public_key_t *pk) {
+void keygen(secret_key_t *sk, public_key_t *pk, uint8_t *master_seed, int key_index) {
     for (int i = 0; i < NUM_BITS; i++) {
         for (int j = 0; j < 2; j++) {
-            // Generate 32 bytes of random data for private key
-            for (int k = 0; k < HASH_SIZE; k++) {
-                sk->blocks[i][j][k] = rand() % 256;
-            }
-            
+            // Hash master_seed + key_index + i + j to pseudo-randomly generate private key
+            uint8_t seed_buffer[HASH_SIZE + 12]; 
+            memcpy(seed_buffer, master_seed, HASH_SIZE);
+            ((uint32_t*)(seed_buffer + HASH_SIZE))[0] = key_index; 
+            ((uint32_t*)(seed_buffer + HASH_SIZE))[1] = i; 
+            ((uint32_t*)(seed_buffer + HASH_SIZE))[2] = j;
+
+            sha256(seed_buffer, HASH_SIZE + 12, sk->blocks[i][j]);
+
             // Public key is simply the hash of that private key
             sha256(sk->blocks[i][j], HASH_SIZE, pk->blocks[i][j]);
         }
@@ -157,7 +161,8 @@ int verify_signature(const public_key_t *pk, const uint8_t *msg_hash, const sign
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 int main(int argc, char *argv[]) {
-    srand((unsigned int)time(NULL));
+    //srand((unsigned int)time(NULL));
+    srand(12345);
 
     // Check if user provided file path
     if (argc < 2) {
@@ -170,9 +175,16 @@ int main(int argc, char *argv[]) {
 
     secret_key_t sk;
     public_key_t pk;
-    signature_t sig;
-    uint8_t file_hash[HASH_SIZE];
 
+    signature_t sig;
+    uint8_t master_seed[HASH_SIZE];
+
+    // Generate random seed on CPU
+    for(int i=0; i<HASH_SIZE; i++) {
+        master_seed[i] = rand() % 256;
+    }
+
+    uint8_t file_hash[HASH_SIZE];
     double start_time, end_time;
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -191,12 +203,12 @@ int main(int argc, char *argv[]) {
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 
     // Key Generation
-    int num_keys = 1024;
+    int num_keys = 65536;
     printf("Generating %d Lamport key pairs...\n", num_keys);
     start_time = get_hw_time();
 
     for (int i = 0; i < num_keys; i++) {
-        keygen(&sk, &pk); 
+        keygen(&sk, &pk, master_seed, i); 
     }
 
     end_time = get_hw_time();
@@ -211,7 +223,8 @@ int main(int argc, char *argv[]) {
     sign_message(&sk, file_hash, &sig);
 
     end_time = get_hw_time();
-    printf("\tSigning took: %.6f seconds\n\n", end_time - start_time);
+    printf("\tSigning took: %.6f seconds\n", end_time - start_time);
+    printf("\tSignature size: %zu bytes\n\n", sizeof(sig));
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 

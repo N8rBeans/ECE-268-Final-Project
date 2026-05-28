@@ -161,12 +161,16 @@ void get_chain_lengths(const uint8_t *msg_hash, uint8_t *chain_lengths) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // WOTS+ Key Generation
-void wots_keygen(wots_key_t *sk, wots_key_t *pk) {
+void wots_keygen(wots_key_t *sk, wots_key_t *pk, uint8_t *master_seed, int leaf_index) {
     for (int i = 0; i < WOTS_LEN; i++) {
-        // Generate random private block
-        for (int k = 0; k < HASH_SIZE; k++) {
-            sk->blocks[i][k] = rand() % 256;
-        }
+        // Hash master_seed + leaf_index + chain_id to pseudo-randomly generate private key
+        uint8_t seed_buffer[HASH_SIZE + 8]; 
+        memcpy(seed_buffer, master_seed, HASH_SIZE);
+        ((uint32_t*)(seed_buffer + HASH_SIZE))[0] = leaf_index; // leaf_index
+        ((uint32_t*)(seed_buffer + HASH_SIZE))[1] = i; 
+        
+        sha256(seed_buffer, HASH_SIZE + 8, sk->blocks[i]);
+        
         // Public block is the private block chained 15 times
         hash_chain(sk->blocks[i], pk->blocks[i], 15);
     }
@@ -199,12 +203,13 @@ void compress_wots_pk(const wots_key_t *pk, uint8_t *leaf_out) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Tree Generation
-void xmss_keygen(wots_key_t *sk_array, uint8_t tree[NUM_NODES][HASH_SIZE]) {
+void xmss_keygen(wots_key_t *sk_array, uint8_t tree[NUM_NODES][HASH_SIZE], uint8_t *master_seed) {
     wots_key_t temp_pk;
     
     // Generate all leaves
     for (int i = 0; i < NUM_LEAVES; i++) {
-        wots_keygen(&sk_array[i], &temp_pk);
+        // Pass the master_seed and the current leaf index down to WOTS+
+        wots_keygen(&sk_array[i], &temp_pk, master_seed, i);
         compress_wots_pk(&temp_pk, tree[NUM_LEAVES + i]);
     }
     
@@ -266,7 +271,8 @@ int xmss_verify(const uint8_t *xmss_pk_root, const uint8_t *msg_hash, const xmss
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 int main(int argc, char *argv[]) {
-    srand((unsigned int)time(NULL));
+    //srand((unsigned int)time(NULL));
+    srand(12345);
 
     // Check if user provided file path
     if (argc < 2) {
@@ -290,6 +296,13 @@ int main(int argc, char *argv[]) {
     }
 
     xmss_signature_t sig;
+    uint8_t master_seed[HASH_SIZE];
+
+    // Generate random seed on CPU
+    for(int i=0; i<HASH_SIZE; i++) {
+        master_seed[i] = rand() % 256;
+    }
+
     uint8_t file_hash[HASH_SIZE];
     double start_time, end_time;
 
@@ -314,7 +327,7 @@ int main(int argc, char *argv[]) {
     printf("Generating %d leaves (XMSS KeyGen)...\n", NUM_LEAVES);
     start_time = get_hw_time();
 
-    xmss_keygen(sk_array, tree);
+    xmss_keygen(sk_array, tree, master_seed);
 
     end_time = get_hw_time();
     printf("\tKey generation took: %.6f seconds\n\n", end_time - start_time);
