@@ -16,6 +16,6 @@ echo =======================================================
 echo RUNNING XMSS
 echo =======================================================
 
-build\xmss.exe "C:\Users\Nathan\Downloads\test.mp4"
+build\xmss.exe data\the_odyssey.txt
 
 echo.

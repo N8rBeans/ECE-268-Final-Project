@@ -178,7 +178,7 @@ __device__ void wots_keygen(wots_key_t *sk, wots_key_t *pk, uint8_t *master_seed
         // Hash master_seed + thread_id + chain_id to pseudo-randomly generate private key
         uint8_t seed_buffer[HASH_SIZE + 8]; 
         memcpy(seed_buffer, master_seed, HASH_SIZE);
-        ((uint32_t*)(seed_buffer + HASH_SIZE))[0] = thread_id; 
+        ((uint32_t*)(seed_buffer + HASH_SIZE))[0] = thread_id; // thread_id
         ((uint32_t*)(seed_buffer + HASH_SIZE))[1] = i; 
         
         sha256(seed_buffer, HASH_SIZE + 8, sk->blocks[i]);
@@ -203,7 +203,9 @@ __device__ void wots_sign(const wots_key_t *sk, const uint8_t *msg_hash, wots_ke
 __device__ void compress_wots_pk(const wots_key_t *pk, uint8_t *leaf_out) {
     SHA256_CTX ctx;
     sha256_init(&ctx);
-    for(int i = 0; i < WOTS_LEN; i++) sha256_update(&ctx, pk->blocks[i], HASH_SIZE);
+    for(int i = 0; i < WOTS_LEN; i++) {
+        sha256_update(&ctx, pk->blocks[i], HASH_SIZE);
+    }
     sha256_final(&ctx, leaf_out);
 }
 
@@ -300,7 +302,8 @@ __global__ void xmss_verify(const uint8_t *xmss_pk_root, const uint8_t *msg_hash
         for (int i = 0; i < HEIGHT; i++) {
             if (node_idx % 2 == 0) {
                 hash_combine(current_node, sig->auth_path[i], current_node);
-            } else {
+            }
+            else {
                 hash_combine(sig->auth_path[i], current_node, current_node);
             }
             node_idx /= 2;

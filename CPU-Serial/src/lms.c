@@ -253,7 +253,8 @@ int lms_verify(const uint8_t *lms_pk_root, const uint8_t *msg_hash, const lms_si
     for (int i = 0; i < HEIGHT; i++) {
         if (node_idx % 2 == 0) {
             hash_combine(current_node, sig->auth_path[i], current_node);
-        } else {
+        }
+        else {
             hash_combine(sig->auth_path[i], current_node, current_node);
         }
         node_idx /= 2;

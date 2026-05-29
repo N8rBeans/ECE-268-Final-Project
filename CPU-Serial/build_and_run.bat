@@ -22,20 +22,20 @@ echo =======================================================
 echo RUNNING LAMPORT
 echo =======================================================
 
-build\lamport.exe "C:\Users\Nathan\Downloads\test.mp4"
+build\lamport.exe data\the_odyssey.txt
 
 echo.
 echo =======================================================
 echo RUNNING XMSS
 echo =======================================================
 
-build\xmss.exe "C:\Users\Nathan\Downloads\test.mp4"
+build\xmss.exe data\the_odyssey.txt
 
 echo.
 echo =======================================================
 echo RUNNING LMS
 echo =======================================================
 
-build\lms.exe "C:\Users\Nathan\Downloads\test.mp4"
+build\lms.exe data\the_odyssey.txt
 
 echo.
