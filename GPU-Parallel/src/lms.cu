@@ -25,12 +25,12 @@ double get_hw_time() {
 }
 #endif
 
-// WOTS+ Parameters (Layer 1)
+// LM-OTS Parameters (Layer 1)
 #define HASH_SIZE 32 // SHA-256 output size
-#define WOTS_LEN 67 // 64 blocks for message + 3 blocks for checksum
+#define LMOTS_LEN 34 // 32 blocks for message + 2 blocks for checksum
 
-// XMSS Parameters (Layer 2)
-#define HEIGHT 16 // Merkle tree height
+// LMS Parameters (Layer 2)
+#define HEIGHT 13 // Merkle tree height
 #define NUM_LEAVES (1 << HEIGHT) // 2^HEIGHT
 #define NUM_NODES (2 * NUM_LEAVES) // 1 based array requires 2*leaves for full tree
 
@@ -39,14 +39,14 @@ double get_hw_time() {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 typedef struct {
-    uint8_t blocks[WOTS_LEN][HASH_SIZE]; // A single WOTS+ key contains 67 32 byte blocks
-} wots_key_t;
+    uint8_t blocks[LMOTS_LEN][HASH_SIZE]; // A single LM-OTS key contains 34 32 byte blocks
+} lmots_key_t;
 
 typedef struct {
     uint32_t index; // The leaf index used for this signature
-    wots_key_t wots_sig; // WOTS+ signature
+    lmots_key_t lmots_sig; // LM-OTS signature
     uint8_t auth_path[HEIGHT][HASH_SIZE]; // Sibling nodes required to calculate root
-} xmss_signature_t;
+} lms_signature_t;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // HELPER FUNCTIONS
@@ -139,83 +139,80 @@ __device__ void hash_chain(const uint8_t *input, uint8_t *output, int iterations
 }
 
 // Checksum Calculation (CUDA function)
-// Converts a 32 byte hash into 64 nibbles (4 bit) and calculates the checksum
+// Converts a 32 byte hash into 32 bytes (8 bit) and calculates the checksum
 // Prevents attackers from simply hashing forward to forge a signature
 __device__ void get_chain_lengths(const uint8_t *msg_hash, uint8_t *chain_lengths) {
     int checksum = 0;
     
-    // Split 32 bytes into 64 nibbles (4 bit)
+    // Split 32 bytes into 32 bytes (8 bit)
     for (int i = 0; i < 32; i++) {
-        chain_lengths[2 * i] = msg_hash[i] >> 4;
-        chain_lengths[2 * i + 1] = msg_hash[i] & 0x0F;
+        chain_lengths[i] = msg_hash[i];
     }
     
     // Calculate checksum
-    // Sum of (15 - chunk_value)
-    for (int i = 0; i < 64; i++) {
-        checksum += (15 - chain_lengths[i]);
+    // Sum of (255 - chunk_value)
+    for (int i = 0; i < 32; i++) {
+        checksum += (255 - chain_lengths[i]);
     }
     
-    // Append checksum as 3 additional chunks
-    // Need to be able to store 64 chunks * 15 = 960
-    // Each chunk can only hold max value 15
-    // 1 chunk max capacity = 15
-    // 2 chunk max capacity = 255
-    // 3 chunk max capacity = 4095
-    // Use 0x0F mask to only save the bottom 4 bits (nibble)
-    chain_lengths[64] = (checksum >> 8) & 0x0F;
-    chain_lengths[65] = (checksum >> 4) & 0x0F;
-    chain_lengths[66] = checksum & 0x0F;
+    // Append checksum as 2 additional chunks
+    // Need to be able to store 32 chunks * 255 = 8160
+    // Each chunk can only hold max value 255
+    // 1 chunk max capacity = 255
+    // 2 chunk max capacity = 65535
+    // Use 0xFF mask to save all 8 bits (byte)
+    chain_lengths[32] = (checksum >> 8) & 0xFF;
+    chain_lengths[33] = checksum & 0xFF;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// Winternitz OTS Functions
+// Leighton-Micali OTS Functions
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// WOTS+ Key Generation (CUDA function)
-__device__ void wots_keygen(wots_key_t *sk, wots_key_t *pk, uint8_t *master_seed, int thread_id) {
-    for (int i = 0; i < WOTS_LEN; i++) {
-        // Hash master_seed + thread_id + chain_id to pseudo-randomly generate private key
+// LM-OTS Key Generation (CUDA function)
+__device__ void lmots_keygen(lmots_key_t *sk, lmots_key_t *pk, uint8_t *master_seed, int leaf_index) {
+    for (int i = 0; i < LMOTS_LEN; i++) {
+        // Hash master_seed + leaf_index + chain_id to pseudo-randomly generate private key
         uint8_t seed_buffer[HASH_SIZE + 8]; 
         memcpy(seed_buffer, master_seed, HASH_SIZE);
-        ((uint32_t*)(seed_buffer + HASH_SIZE))[0] = thread_id; // thread_id
+        ((uint32_t*)(seed_buffer + HASH_SIZE))[0] = leaf_index; // leaf_index
         ((uint32_t*)(seed_buffer + HASH_SIZE))[1] = i; 
         
         sha256(seed_buffer, HASH_SIZE + 8, sk->blocks[i]);
         
-        // Public block is the private block chained 15 times
-        hash_chain(sk->blocks[i], pk->blocks[i], 15);
+        // Public block is the private block chained 255 times
+        hash_chain(sk->blocks[i], pk->blocks[i], 255);
     }
 }
 
-// WOTS+ Signing (CUDA function)
-__device__ void wots_sign(const wots_key_t *sk, const uint8_t *msg_hash, wots_key_t *sig) {
-    uint8_t chains[WOTS_LEN];
+// LM-OTS Signing (CUDA function)
+__device__ void lmots_sign(const lmots_key_t *sk, const uint8_t *msg_hash, lmots_key_t *sig) {
+    uint8_t chains[LMOTS_LEN];
     get_chain_lengths(msg_hash, chains);
     
     // Hash each block a specific number of times based on the message chunk
-    for (int i = 0; i < WOTS_LEN; i++) {
+    for (int i = 0; i < LMOTS_LEN; i++) {
         hash_chain(sk->blocks[i], sig->blocks[i], chains[i]);
     }
 }
 
-// Compress WOTS+ PK (CUDA function)
-// Takes 67 block public key and hashes it down to a single 32 byte Merkle leaf
-__device__ void compress_wots_pk(const wots_key_t *pk, uint8_t *leaf_out) {
+// Compress LM-OTS PK (CUDA function)
+// Takes 34 block public key and hashes it down to a single 32 byte Merkle leaf
+__device__ void compress_lmots_pk(const lmots_key_t *pk, uint8_t *leaf_out) {
     SHA256_CTX ctx;
     sha256_init(&ctx);
-    for(int i = 0; i < WOTS_LEN; i++) {
+    for(int i = 0; i < LMOTS_LEN; i++) {
         sha256_update(&ctx, pk->blocks[i], HASH_SIZE);
     }
     sha256_final(&ctx, leaf_out);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// XMSS Merkle Tree Functions
+// LMS Merkle Tree Functions
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Tree Generation 1 (CUDA kernel, parallel)
-__global__ void xmss_generate_leaves(wots_key_t *sk_array, uint8_t tree[NUM_NODES][HASH_SIZE], uint8_t *master_seed) {
+__global__ void lms_generate_leaves(lmots_key_t *sk_array, uint8_t tree[NUM_NODES][HASH_SIZE], uint8_t *master_seed) {
     int tx = threadIdx.x;
     int bx = blockIdx.x;
 
@@ -224,16 +221,16 @@ __global__ void xmss_generate_leaves(wots_key_t *sk_array, uint8_t tree[NUM_NODE
 
     // Grid stride loop
     for (int i = bx * bs + tx; i < NUM_LEAVES; i += gs * bs) {
-        wots_key_t temp_pk;
+        lmots_key_t temp_pk;
 
         // Pass the master_seed and the current leaf index down to WOTS+
-        wots_keygen(&sk_array[i], &temp_pk, master_seed, i);
-        compress_wots_pk(&temp_pk, tree[NUM_LEAVES + i]);
+        lmots_keygen(&sk_array[i], &temp_pk, master_seed, i);
+        compress_lmots_pk(&temp_pk, tree[NUM_LEAVES + i]);
     }
 }
 
 // Tree Generation 2 (CUDA kernel, serial)
-__global__ void xmss_build_tree(uint8_t tree[NUM_NODES][HASH_SIZE]) {
+__global__ void lms_build_tree(uint8_t tree[NUM_NODES][HASH_SIZE]) {
     int tx = threadIdx.x;
     int bx = blockIdx.x;
 
@@ -251,7 +248,7 @@ __global__ void xmss_build_tree(uint8_t tree[NUM_NODES][HASH_SIZE]) {
 }
 
 // Signing (CUDA kernel, serial)
-__global__ void xmss_sign(wots_key_t *sk_array, uint8_t tree[NUM_NODES][HASH_SIZE], uint32_t index, const uint8_t *msg_hash, xmss_signature_t *sig) {
+__global__ void lms_sign(lmots_key_t *sk_array, uint8_t tree[NUM_NODES][HASH_SIZE], uint32_t index, const uint8_t *msg_hash, lms_signature_t *sig) {
     int tx = threadIdx.x;
     int bx = blockIdx.x;
 
@@ -261,7 +258,7 @@ __global__ void xmss_sign(wots_key_t *sk_array, uint8_t tree[NUM_NODES][HASH_SIZ
     // Process is serial, so only use first thread
     if (bx == 0 && tx == 0) {
         sig->index = index;
-        wots_sign(&sk_array[index], msg_hash, &sig->wots_sig);
+        lmots_sign(&sk_array[index], msg_hash, &sig->lmots_sig);
         
         // Collect the authentication path (sibling nodes) needed to calculate the root
         int node = NUM_LEAVES + index;
@@ -274,7 +271,7 @@ __global__ void xmss_sign(wots_key_t *sk_array, uint8_t tree[NUM_NODES][HASH_SIZ
 }
 
 // Verification (CUDA kernel, serial)
-__global__ void xmss_verify(const uint8_t *xmss_pk_root, const uint8_t *msg_hash, const xmss_signature_t *sig, int *is_valid) {
+__global__ void lms_verify(const uint8_t *lms_pk_root, const uint8_t *msg_hash, const lms_signature_t *sig, int *is_valid) {
     int tx = threadIdx.x;
     int bx = blockIdx.x;
 
@@ -283,20 +280,20 @@ __global__ void xmss_verify(const uint8_t *xmss_pk_root, const uint8_t *msg_hash
 
     // Process is serial, so only use first thread
     if (bx == 0 && tx == 0) {
-        uint8_t chains[WOTS_LEN];
+        uint8_t chains[LMOTS_LEN];
         get_chain_lengths(msg_hash, chains);
         
-        wots_key_t computed_wots_pk;
-
-        // 1. Rebuild the WOTS public key by hashing the remaining distance to 15
-        for (int i = 0; i < WOTS_LEN; i++) {
-            int remaining = 15 - chains[i];
-            hash_chain(sig->wots_sig.blocks[i], computed_wots_pk.blocks[i], remaining);
+        lmots_key_t computed_lmots_pk;
+        
+        // 1. Rebuild the LM-OTS public key by hashing the remaining distance to 255
+        for (int i = 0; i < LMOTS_LEN; i++) {
+            int remaining = 255 - chains[i];
+            hash_chain(sig->lmots_sig.blocks[i], computed_lmots_pk.blocks[i], remaining);
         }
         
         // 2. Compress it to get the presumed Merkle leaf
         uint8_t current_node[HASH_SIZE];
-        compress_wots_pk(&computed_wots_pk, current_node);
+        compress_lmots_pk(&computed_lmots_pk, current_node);
         
         // 3. Follow the authentication path to rebuild the Merkle root
         int node_idx = NUM_LEAVES + sig->index;
@@ -312,7 +309,7 @@ __global__ void xmss_verify(const uint8_t *xmss_pk_root, const uint8_t *msg_hash
         
         // 4. If our rebuilt root matches the known public key, the signature is valid
         // Set is_valid instead of return
-        *is_valid = (device_memcmp(current_node, xmss_pk_root, HASH_SIZE) == 0);
+        *is_valid = (device_memcmp(current_node, lms_pk_root, HASH_SIZE) == 0);
     }
 }
 
@@ -331,19 +328,19 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("XMSS Pipeline Benchmark (Tree Height: %d)\n\n", HEIGHT);
+    printf("LMS Pipeline Benchmark (Tree Height: %d)\n\n", HEIGHT);
 
     // RAM allocation for large trees
-    size_t memory_needed = ((NUM_LEAVES * sizeof(wots_key_t)) + (NUM_NODES * HASH_SIZE)) / (1024 * 1024);
+    size_t memory_needed = ((NUM_LEAVES * sizeof(lmots_key_t)) + (NUM_NODES * HASH_SIZE)) / (1024 * 1024);
     printf("Allocating %zu MB of Unified GPU memory...\n\n", memory_needed);
           
-    wots_key_t *sk_array;
-    cudaMallocManaged(&sk_array, NUM_LEAVES * sizeof(wots_key_t));
+    lmots_key_t *sk_array;
+    cudaMallocManaged(&sk_array, NUM_LEAVES * sizeof(lmots_key_t));
     uint8_t (*tree)[HASH_SIZE];
     cudaMallocManaged(&tree, NUM_NODES * HASH_SIZE);
 
-    xmss_signature_t *sig;
-    cudaMallocManaged(&sig, sizeof(xmss_signature_t));
+    lms_signature_t *sig;
+    cudaMallocManaged(&sig, sizeof(lms_signature_t));
     uint8_t *master_seed;
     cudaMallocManaged(&master_seed, HASH_SIZE);
     int *is_valid;
@@ -368,7 +365,7 @@ int main(int argc, char *argv[]) {
         free(tree);
         return 1;
     }
-    
+
     end_time = get_hw_time();
     printf("\tFile hashing took: %.6f seconds\n\n", end_time - start_time);
 
@@ -382,22 +379,22 @@ int main(int argc, char *argv[]) {
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 
     // Key Generation
-    printf("Generating %d leaves (XMSS KeyGen)...\n", NUM_LEAVES);
+    printf("Generating %d leaves (LMS KeyGen)...\n", NUM_LEAVES);
 
     // Set up CUDA: 256 threads per block
     int threadsPerBlock = 256;
     int blocksPerGrid = (NUM_LEAVES + threadsPerBlock - 1) / threadsPerBlock;
 
     start_time = get_hw_time();
-    
+
     // Tree Generation 1
-    xmss_generate_leaves<<<blocksPerGrid, threadsPerBlock>>>(sk_array, tree, master_seed);
+    lms_generate_leaves<<<blocksPerGrid, threadsPerBlock>>>(sk_array, tree, master_seed);
     cudaDeviceSynchronize();
     
     // Tree Generation 2
-    xmss_build_tree<<<1, 1>>>(tree);
+    lms_build_tree<<<1, 1>>>(tree);
     cudaDeviceSynchronize(); 
-    
+
     end_time = get_hw_time();
     printf("\tKey generation took: %.6f seconds\n\n", end_time - start_time);
 
@@ -408,7 +405,7 @@ int main(int argc, char *argv[]) {
     printf("Signing message at index %u...\n", test_index);
     start_time = get_hw_time();
 
-    xmss_sign<<<1, 1>>>(sk_array, tree, test_index, d_msg_hash, sig);
+    lms_sign<<<1, 1>>>(sk_array, tree, test_index, d_msg_hash, sig);
     cudaDeviceSynchronize();
 
     end_time = get_hw_time();
@@ -418,12 +415,12 @@ int main(int argc, char *argv[]) {
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 
     // Verification
-    printf("Verifying XMSS signature...\n");
+    printf("Verifying LMS signature...\n");
     start_time = get_hw_time();
 
-    xmss_verify<<<1, 1>>>(tree[1], d_msg_hash, sig, is_valid);
+    lms_verify<<<1, 1>>>(tree[1], d_msg_hash, sig, is_valid);
     cudaDeviceSynchronize();
-    
+
     end_time = get_hw_time();
     if (*is_valid) {
         printf("\tResult: SUCCESS (Valid)\n");
@@ -437,10 +434,10 @@ int main(int argc, char *argv[]) {
 
     // Write output files
     printf("Exporting files to output directory...\n");
-    write_hex_file("output/xmss_hash.txt", file_hash, HASH_SIZE);
-    write_hex_file("output/xmss_public_key_root.txt", tree[1], HASH_SIZE);
+    write_hex_file("output/lms_hash.txt", file_hash, HASH_SIZE);
+    write_hex_file("output/lms_public_key_root.txt", tree[1], HASH_SIZE);
     // Cast signature struct to byte array to dump its raw memory
-    write_hex_file("output/xmss_sig.txt", (const uint8_t *)sig, sizeof(*sig));
+    write_hex_file("output/lms_sig.txt", (const uint8_t *)sig, sizeof(*sig));
     printf("\tDone.\n\n");
 
     // Free memory
