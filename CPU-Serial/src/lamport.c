@@ -173,6 +173,12 @@ int main(int argc, char *argv[]) {
 
     printf("Lamport One-Time Signature Benchmark\n\n");
 
+    int num_keys = 65536;
+
+    // RAM allocation
+    size_t memory_needed = ((num_keys*sizeof(secret_key_t)) + (num_keys*sizeof(public_key_t))) / (1024 * 1024);
+    printf("Allocating %zu MB of memory...\n\n", memory_needed);
+
     secret_key_t sk;
     public_key_t pk;
 
@@ -203,7 +209,6 @@ int main(int argc, char *argv[]) {
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 
     // Key Generation
-    int num_keys = 65536;
     printf("Generating %d Lamport key pairs...\n", num_keys);
     start_time = get_hw_time();
 

@@ -94,7 +94,7 @@ void write_hex_file(const char *filename, const uint8_t *data, size_t len) {
     fclose(f);
 }
 
-// Bit Extraction
+// Bit Extraction (CUDA function)
 // Safely pulls a single bit (0 or 1) from the 32 byte message hash using provided index
 __device__ int get_bit(const uint8_t *bytes, int bit_idx) {
     int byte_idx = bit_idx / 8;
@@ -118,44 +118,41 @@ __device__ int device_memcmp(const void *s1, const void *s2, size_t n) {
 // CORE FUNCTIONS
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-//TODO
-// Key Generation
+// Key Generation (CUDA kernel, parallel)
 // Fills secret key array with random numbers, then hashes each one once to create public key array
-__global__ void keygen(secret_key_t *s, public_key_t *p, uint8_t *master_seed) {
-
+__global__ void keygen(secret_key_t *sk_array, public_key_t *pk_array, uint8_t *master_seed, int total_keys) {
     int tx = threadIdx.x;
     int bx = blockIdx.x;
 
     int bs = blockDim.x;
     int gs = gridDim.x;
 
-    secret_key_t *sk = &s[bx];
-    public_key_t *pk = &p[bx];
+    // Grid stride loop
+    for (int key_idx = bx * bs + tx; key_idx < total_keys; key_idx += gs * bs) {
+        // Each thread calculates all 256 bits for its assigned key
+        for (int i = 0; i < NUM_BITS; i++) {
+            for (int j = 0; j < 2; j++) {
+                // Hash master_seed + key_index + i + j to pseudo-randomly generate private key
+                uint8_t seed_buffer[HASH_SIZE + 12];
+                memcpy(seed_buffer, master_seed, HASH_SIZE);
+                ((uint32_t*)(seed_buffer + HASH_SIZE))[0] = key_idx; 
+                ((uint32_t*)(seed_buffer + HASH_SIZE))[1] = i; 
+                ((uint32_t*)(seed_buffer + HASH_SIZE))[2] = j;
 
-    for (int i = tx; i < NUM_BITS; i += bs) {
-        for (int j = 0; j < 2; j++) {
-            // Hash master_seed + key_index + i + j to pseudo-randomly generate private key
-            uint8_t seed_buffer[HASH_SIZE + 12];
-            memcpy(seed_buffer, master_seed, HASH_SIZE);
-            ((uint32_t*)(seed_buffer + HASH_SIZE))[0] = bx; 
-            ((uint32_t*)(seed_buffer + HASH_SIZE))[1] = i; 
-            ((uint32_t*)(seed_buffer + HASH_SIZE))[2] = j;
+                sha256(seed_buffer, HASH_SIZE + 12, sk_array[key_idx].blocks[i][j]);
 
-            sha256(seed_buffer, HASH_SIZE + 12, sk->blocks[i][j]);
-
-            // Public key is simply the hash of that private key
-            sha256(sk->blocks[i][j], HASH_SIZE, pk->blocks[i][j]);
+                // Public key is simply the hash of that private key
+                sha256(sk_array[key_idx].blocks[i][j], HASH_SIZE, pk_array[key_idx].blocks[i][j]);
+            }
         }
     }
 }
 
-//TODO
-// Signing
+// Signing (CUDA kernel, serial)
 // Looks at message bit by bit
 // If the bit is 0, reveal the first secret block
 // If the bit is 1, reveal the second secret block
 __global__ void sign_message(const secret_key_t *sk, const uint8_t *msg_hash, signature_t *sig) {
-
     int tx = threadIdx.x;
     int bx = blockIdx.x;
 
@@ -170,11 +167,9 @@ __global__ void sign_message(const secret_key_t *sk, const uint8_t *msg_hash, si
     }
 }
 
-//TODO
-// Verification
+// Verification (CUDA kernel, serial)
 // Takes blocks provided in the signature, hashes them, and checks if they match the corresponding public key blocks
 __global__ void verify_signature(const public_key_t *pk, const uint8_t *msg_hash, const signature_t *sig, int *is_valid) {
-
     int tx = threadIdx.x;
     int bx = blockIdx.x;
 
@@ -218,10 +213,16 @@ int main(int argc, char *argv[]) {
     printf("Lamport One-Time Signature Benchmark\n\n");
 
     int num_keys = 65536;
-    secret_key_t *sk;
-    cudaMallocManaged(&sk, num_keys*sizeof(secret_key_t));
-    public_key_t *pk;
-    cudaMallocManaged(&pk, num_keys*sizeof(public_key_t));
+
+    // RAM allocation
+    size_t memory_needed = ((num_keys*sizeof(secret_key_t)) + (num_keys*sizeof(public_key_t))) / (1024 * 1024);
+    printf("Allocating %zu MB of Unified GPU memory...\n\n", memory_needed);
+    
+    secret_key_t *sk_array;
+    cudaMallocManaged(&sk_array, num_keys*sizeof(secret_key_t));
+    public_key_t *pk_array;
+    cudaMallocManaged(&pk_array, num_keys*sizeof(public_key_t));
+
     signature_t *sig;
     cudaMallocManaged(&sig, sizeof(signature_t));
     uint8_t *master_seed;
@@ -244,7 +245,8 @@ int main(int argc, char *argv[]) {
     start_time = get_hw_time();
     
     if (!get_file_hash(argv[1], file_hash)) {
-        //free(sk);
+        free(sk_array);
+        free(pk_array);
         return 1;
     }
     
@@ -265,11 +267,11 @@ int main(int argc, char *argv[]) {
     printf("Generating %d Lamport key pairs...\n", num_keys);
 
     int threadsPerBlock = 256;
-    int blocksPerGrid = (NUM_BITS + threadsPerBlock - 1) / threadsPerBlock;
+    int blocksPerGrid = (num_keys + threadsPerBlock - 1) / threadsPerBlock;
 
     start_time = get_hw_time();
 
-    keygen<<<num_keys, threadsPerBlock>>>(sk, pk, master_seed);
+    keygen<<<blocksPerGrid, threadsPerBlock>>>(sk_array, pk_array, master_seed, num_keys);
     cudaDeviceSynchronize(); 
 
     end_time = get_hw_time();
@@ -281,7 +283,7 @@ int main(int argc, char *argv[]) {
     printf("Signing the file hash...\n");
     start_time = get_hw_time();
 
-    sign_message<<<1,1>>>(&sk[num_keys - 1], d_msg_hash, sig);
+    sign_message<<<1,1>>>(&sk_array[num_keys - 1], d_msg_hash, sig);
     cudaDeviceSynchronize();
 
     end_time = get_hw_time();
@@ -294,7 +296,7 @@ int main(int argc, char *argv[]) {
     printf("Verifying signature...\n");
     start_time = get_hw_time();
 
-    verify_signature<<<1, 1>>>(&pk[num_keys - 1], d_msg_hash, sig, is_valid);
+    verify_signature<<<1, 1>>>(&pk_array[num_keys - 1], d_msg_hash, sig, is_valid);
     cudaDeviceSynchronize();
 
     end_time = get_hw_time();
@@ -315,8 +317,8 @@ int main(int argc, char *argv[]) {
     write_hex_file("output/lamport_sig.txt", (const uint8_t *)sig, sizeof(*sig));
     printf("\tDone.\n\n");
 
-    cudaFree(sk);
-    cudaFree(pk);
+    cudaFree(sk_array);
+    cudaFree(pk_array);
     cudaFree(sig);
     cudaFree(master_seed);
     cudaFree(is_valid);

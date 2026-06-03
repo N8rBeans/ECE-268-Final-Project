@@ -33,7 +33,7 @@ build\xmss.exe data\the_odyssey.txt
 
 echo.
 echo =======================================================
-echo RUNNING XMSS
+echo RUNNING LMS
 echo =======================================================
 
 build\lms.exe data\the_odyssey.txt
