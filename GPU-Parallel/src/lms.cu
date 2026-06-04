@@ -211,7 +211,7 @@ __device__ void compress_lmots_pk(const lmots_key_t *pk, uint8_t *leaf_out) {
 // LMS Merkle Tree Functions
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Tree Generation 1 (CUDA kernel, parallel)
+// Tree Generation 1 (CUDA kernel)
 __global__ void lms_generate_leaves(lmots_key_t *sk_array, uint8_t tree[NUM_NODES][HASH_SIZE], uint8_t *master_seed) {
     int tx = threadIdx.x;
     int bx = blockIdx.x;
@@ -229,25 +229,24 @@ __global__ void lms_generate_leaves(lmots_key_t *sk_array, uint8_t tree[NUM_NODE
     }
 }
 
-// Tree Generation 2 (CUDA kernel, serial)
-__global__ void lms_build_tree(uint8_t tree[NUM_NODES][HASH_SIZE]) {
+// Tree Generation 2 (CUDA kernel)
+__global__ void lms_build_tree_layer(uint8_t tree[NUM_NODES][HASH_SIZE], int num_nodes_in_layer, int offset) {
     int tx = threadIdx.x;
     int bx = blockIdx.x;
 
     int bs = blockDim.x;
     int gs = gridDim.x;
 
-    // Process is serial, so only use first thread
-    if (bx == 0 && tx == 0) {
-        // Build tree bottom-up
-        // tree[1] will hold the final Root Hash (XMSS Public Key)
-        for (int i = NUM_LEAVES - 1; i > 0; i--) {
-            hash_combine(tree[2 * i], tree[2 * i + 1], tree[i]);
-        }
+    // Grid stride loop
+    for (int i = bx * bs + tx; i < num_nodes_in_layer; i += gs * bs) {
+        int node_idx = offset + i;
+        // tree[1] will hold the final Root Hash (LMS Public Key)
+        // Hash the two children to create the parent
+        hash_combine(tree[2 * node_idx], tree[2 * node_idx + 1], tree[node_idx]);
     }
 }
 
-// Signing (CUDA kernel, serial)
+// Signing (CUDA kernel)
 __global__ void lms_sign(lmots_key_t *sk_array, uint8_t tree[NUM_NODES][HASH_SIZE], uint32_t index, const uint8_t *msg_hash, lms_signature_t *sig) {
     int tx = threadIdx.x;
     int bx = blockIdx.x;
@@ -255,12 +254,25 @@ __global__ void lms_sign(lmots_key_t *sk_array, uint8_t tree[NUM_NODES][HASH_SIZ
     int bs = blockDim.x;
     int gs = gridDim.x;
 
-    // Process is serial, so only use first thread
-    if (bx == 0 && tx == 0) {
+    // Shared memory between threads
+    __shared__ uint8_t chains[LMOTS_LEN];
+
+    // Thread 0 sets up metadata and calculates checksum chains
+    if (tx == 0) {
         sig->index = index;
-        lmots_sign(&sk_array[index], msg_hash, &sig->lmots_sig);
-        
-        // Collect the authentication path (sibling nodes) needed to calculate the root
+        get_chain_lengths(msg_hash, chains);
+    }
+    // Wait for Thread 0 to finish setup
+    __syncthreads();
+
+    // All 34 threads compute their specific blocks hash chain in parallel
+    if (tx < LMOTS_LEN) {
+        hash_chain(sk_array[index].blocks[tx], sig->lmots_sig.blocks[tx], chains[tx]);
+    }
+
+    // Thread 0 collects the auth path 
+    // Only 16 items, fast enough serially
+    if (tx == 0) {
         int node = NUM_LEAVES + index;
         for (int i = 0; i < HEIGHT; i++) {
             int sibling = (node % 2 == 0) ? (node + 1) : (node - 1);
@@ -270,7 +282,7 @@ __global__ void lms_sign(lmots_key_t *sk_array, uint8_t tree[NUM_NODES][HASH_SIZ
     }
 }
 
-// Verification (CUDA kernel, serial)
+// Verification (CUDA kernel)
 __global__ void lms_verify(const uint8_t *lms_pk_root, const uint8_t *msg_hash, const lms_signature_t *sig, int *is_valid) {
     int tx = threadIdx.x;
     int bx = blockIdx.x;
@@ -278,23 +290,32 @@ __global__ void lms_verify(const uint8_t *lms_pk_root, const uint8_t *msg_hash, 
     int bs = blockDim.x;
     int gs = gridDim.x;
 
-    // Process is serial, so only use first thread
-    if (bx == 0 && tx == 0) {
-        uint8_t chains[LMOTS_LEN];
+    // Shared memory so threads can communicate
+    __shared__ uint8_t chains[LMOTS_LEN];
+    __shared__ lmots_key_t computed_lmots_pk;
+
+    // Thread 0 set up
+    if (tx == 0) {
         get_chain_lengths(msg_hash, chains);
-        
-        lmots_key_t computed_lmots_pk;
-        
-        // 1. Rebuild the LM-OTS public key by hashing the remaining distance to 255
-        for (int i = 0; i < LMOTS_LEN; i++) {
-            int remaining = 255 - chains[i];
-            hash_chain(sig->lmots_sig.blocks[i], computed_lmots_pk.blocks[i], remaining);
-        }
-        
+    }
+    // Wait for Thread 0 to finish setup
+    __syncthreads();
+
+    // 1. Rebuild the WOTS public key by hashing the remaining distance to 255
+    // All 34 threads rebuild the WOTS public key blocks simultaneously
+    if (tx < LMOTS_LEN) {
+        int remaining = 255 - chains[tx];
+        hash_chain(sig->lmots_sig.blocks[tx], computed_lmots_pk.blocks[tx], remaining);
+    }
+    // Wait for all 34 blocks to be done
+    __syncthreads();
+
+    // Thread 0 handles the Merkle math (it is inherently sequential)
+    if (tx == 0) {
         // 2. Compress it to get the presumed Merkle leaf
         uint8_t current_node[HASH_SIZE];
         compress_lmots_pk(&computed_lmots_pk, current_node);
-        
+
         // 3. Follow the authentication path to rebuild the Merkle root
         int node_idx = NUM_LEAVES + sig->index;
         for (int i = 0; i < HEIGHT; i++) {
@@ -306,9 +327,7 @@ __global__ void lms_verify(const uint8_t *lms_pk_root, const uint8_t *msg_hash, 
             }
             node_idx /= 2;
         }
-        
         // 4. If our rebuilt root matches the known public key, the signature is valid
-        // Set is_valid instead of return
         *is_valid = (device_memcmp(current_node, lms_pk_root, HASH_SIZE) == 0);
     }
 }
@@ -361,8 +380,8 @@ int main(int argc, char *argv[]) {
     start_time = get_hw_time();
     
     if (!get_file_hash(argv[1], file_hash)) {
-        free(sk_array);
-        free(tree);
+        cudaFree(sk_array);
+        cudaFree(tree);
         return 1;
     }
 
@@ -391,9 +410,13 @@ int main(int argc, char *argv[]) {
     lms_generate_leaves<<<blocksPerGrid, threadsPerBlock>>>(sk_array, tree, master_seed);
     cudaDeviceSynchronize();
     
-    // Tree Generation 2
-    lms_build_tree<<<1, 1>>>(tree);
-    cudaDeviceSynchronize(); 
+    // Tree Generation 2 (Parallel Reduction Loop)
+    // Start at the bottom layer (4096 nodes) and halve the nodes every step
+    for (int layer_size = NUM_LEAVES / 2; layer_size > 0; layer_size /= 2) {
+        int blocks = (layer_size + threadsPerBlock - 1) / threadsPerBlock;
+        lms_build_tree_layer<<<blocks, threadsPerBlock>>>(tree, layer_size, layer_size);
+        cudaDeviceSynchronize(); 
+    }
 
     end_time = get_hw_time();
     printf("\tKey generation took: %.6f seconds\n\n", end_time - start_time);
@@ -405,7 +428,7 @@ int main(int argc, char *argv[]) {
     printf("Signing message at index %u...\n", test_index);
     start_time = get_hw_time();
 
-    lms_sign<<<1, 1>>>(sk_array, tree, test_index, d_msg_hash, sig);
+    lms_sign<<<1, LMOTS_LEN>>>(sk_array, tree, test_index, d_msg_hash, sig);
     cudaDeviceSynchronize();
 
     end_time = get_hw_time();
@@ -418,7 +441,7 @@ int main(int argc, char *argv[]) {
     printf("Verifying LMS signature...\n");
     start_time = get_hw_time();
 
-    lms_verify<<<1, 1>>>(tree[1], d_msg_hash, sig, is_valid);
+    lms_verify<<<1, LMOTS_LEN>>>(tree[1], d_msg_hash, sig, is_valid);
     cudaDeviceSynchronize();
 
     end_time = get_hw_time();

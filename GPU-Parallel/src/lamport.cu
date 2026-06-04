@@ -118,7 +118,7 @@ __device__ int device_memcmp(const void *s1, const void *s2, size_t n) {
 // CORE FUNCTIONS
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Key Generation (CUDA kernel, parallel)
+// Key Generation (CUDA kernel)
 // Fills secret key array with random numbers, then hashes each one once to create public key array
 __global__ void keygen(secret_key_t *sk_array, public_key_t *pk_array, uint8_t *master_seed, int total_keys) {
     int tx = threadIdx.x;
@@ -148,7 +148,7 @@ __global__ void keygen(secret_key_t *sk_array, public_key_t *pk_array, uint8_t *
     }
 }
 
-// Signing (CUDA kernel, serial)
+// Signing (CUDA kernel)
 // Looks at message bit by bit
 // If the bit is 0, reveal the first secret block
 // If the bit is 1, reveal the second secret block
@@ -159,15 +159,14 @@ __global__ void sign_message(const secret_key_t *sk, const uint8_t *msg_hash, si
     int bs = blockDim.x;
     int gs = gridDim.x;
 
-    if (bx == 0 && tx == 0) {
-        for (int i = bx * bs + tx; i < NUM_BITS; i += gs * bs) {
-            int bit = get_bit(msg_hash, i);
-            memcpy(sig->blocks[i], sk->blocks[i][bit], HASH_SIZE);
-        }
+    // All 256 threads compute operate on each bit in parallel
+    if (tx < NUM_BITS) {
+        int bit = get_bit(msg_hash, tx);
+        memcpy(sig->blocks[tx], sk->blocks[tx][bit], HASH_SIZE);
     }
 }
 
-// Verification (CUDA kernel, serial)
+// Verification (CUDA kernel)
 // Takes blocks provided in the signature, hashes them, and checks if they match the corresponding public key blocks
 __global__ void verify_signature(const public_key_t *pk, const uint8_t *msg_hash, const signature_t *sig, int *is_valid) {
     int tx = threadIdx.x;
@@ -176,22 +175,16 @@ __global__ void verify_signature(const public_key_t *pk, const uint8_t *msg_hash
     int bs = blockDim.x;
     int gs = gridDim.x;
     
-    if (bx == 0 && tx == 0) {
+    // All 256 threads compute operate on each bit in parallel
+    if (tx < NUM_BITS) {
         uint8_t computed_hash[HASH_SIZE];
-
-        *is_valid = 1;
-        for (int i = 0; i < NUM_BITS; i++) {
-            int bit = get_bit(msg_hash, i);
-            
-            // Hash the data the signer gave us
-            sha256(sig->blocks[i], HASH_SIZE, computed_hash);
-            
-            // If it doesnt match the public key, the signature is forged or invalid
-            if (device_memcmp(computed_hash, pk->blocks[i][bit], HASH_SIZE) != 0){
-                *is_valid = 0;
-                break;
-            };
-        }
+        int bit = get_bit(msg_hash, tx);
+        
+        // Hash the specific block the signer gave us
+        sha256(sig->blocks[tx], HASH_SIZE, computed_hash);
+        
+        // If it doesnt match the public key, the signature is forged or invalid
+        *is_valid = (device_memcmp(computed_hash, pk->blocks[tx][bit], HASH_SIZE) == 0);
     }
 }
 
@@ -230,7 +223,7 @@ int main(int argc, char *argv[]) {
     int *is_valid;
     cudaMallocManaged(&is_valid, sizeof(int));
 
-    // Generate random seed on CPU
+    // Generate random seed on CPU to pass to GPU
     for(int i=0; i<HASH_SIZE; i++) {
         master_seed[i] = rand() % 256;
     }
@@ -245,8 +238,8 @@ int main(int argc, char *argv[]) {
     start_time = get_hw_time();
     
     if (!get_file_hash(argv[1], file_hash)) {
-        free(sk_array);
-        free(pk_array);
+        cudaFree(sk_array);
+        cudaFree(pk_array);
         return 1;
     }
     
@@ -283,7 +276,7 @@ int main(int argc, char *argv[]) {
     printf("Signing the file hash...\n");
     start_time = get_hw_time();
 
-    sign_message<<<1,1>>>(&sk_array[num_keys - 1], d_msg_hash, sig);
+    sign_message<<<1,NUM_BITS>>>(&sk_array[num_keys - 1], d_msg_hash, sig);
     cudaDeviceSynchronize();
 
     end_time = get_hw_time();
@@ -296,7 +289,7 @@ int main(int argc, char *argv[]) {
     printf("Verifying signature...\n");
     start_time = get_hw_time();
 
-    verify_signature<<<1, 1>>>(&pk_array[num_keys - 1], d_msg_hash, sig, is_valid);
+    verify_signature<<<1, NUM_BITS>>>(&pk_array[num_keys - 1], d_msg_hash, sig, is_valid);
     cudaDeviceSynchronize();
 
     end_time = get_hw_time();
