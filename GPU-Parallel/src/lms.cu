@@ -271,7 +271,7 @@ __global__ void lms_sign(lmots_key_t *sk_array, uint8_t tree[NUM_NODES][HASH_SIZ
     }
 
     // Thread 0 collects the auth path 
-    // Only 16 items, fast enough serially
+    // Only traversing height of tree, fast enough serially
     if (tx == 0) {
         int node = NUM_LEAVES + index;
         for (int i = 0; i < HEIGHT; i++) {

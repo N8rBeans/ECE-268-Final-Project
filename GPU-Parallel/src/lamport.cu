@@ -205,7 +205,7 @@ int main(int argc, char *argv[]) {
 
     printf("Lamport One-Time Signature Benchmark\n\n");
 
-    int num_keys = 65536;
+    int num_keys = 1<<13;
 
     // RAM allocation
     size_t memory_needed = ((num_keys*sizeof(secret_key_t)) + (num_keys*sizeof(public_key_t))) / (1024 * 1024);

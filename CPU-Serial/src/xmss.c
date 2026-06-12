@@ -30,7 +30,7 @@ double get_hw_time() {
 #define WOTS_LEN 67 // 64 blocks for message + 3 blocks for checksum
 
 // XMSS Parameters (Layer 2)
-#define HEIGHT 16 // Merkle tree height
+#define HEIGHT 13 // Merkle tree height
 #define NUM_LEAVES (1 << HEIGHT) // 2^HEIGHT
 #define NUM_NODES (2 * NUM_LEAVES) // 1 based array requires 2*leaves for full tree
 
